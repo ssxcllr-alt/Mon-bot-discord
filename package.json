@@ -1,0 +1,31 @@
+{
+  "name": "mon-bot-discord-by-seiko",
+  "version": "1.0.0",
+  "description": "Bot Discord multifonctions avec système de dog, gestion de rôles et logs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "discord.js",
+    "moderation",
+    "utility"
+  ],
+  "author": "Seiko",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "fs": "0.0.1-security",
+    "http": "^0.0.1-security",
+    "https": "^1.0.0",
+    "path": "^0.12.7"
+  },
+  "engines": {
+    "node": ">=16.11.0"
+  }
+}
+
