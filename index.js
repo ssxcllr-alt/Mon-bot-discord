@@ -1,4 +1,4 @@
-);
+require('dotenv').config();
 const { Client, GatewayIntentBits, Collection, PermissionsBitField } = require('discord.js');
 const fs = require('fs');
 const DataSaver = require('./dataSaver');
