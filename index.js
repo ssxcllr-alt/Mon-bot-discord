@@ -5,8 +5,8 @@ const DataSaver = require('./dataSaver');
 const GiveawayHandler = require('./commands/giveaway/giveawayHandler');
 
 // 👇 REMPLACE par TON ID Discord (Mode Développeur ON → Clic droit → Copier ID)
-const OWNERS = ['1422102360246980792'];                    // Toi + amis owners
-const PRINCIPAL_OWNER = '1422102360246980792';             // TOI SEUL (!owners)
+const OWNERS = ['726063885492158474'];                    // Toi + amis owners
+const PRINCIPAL_OWNER = '726063885492158474';             // TOI SEUL (!owners)
 
 const client = new Client({ 
     intents: [
