@@ -1,543 +1,834 @@
-require('dotenv').config();
+// ============================================================
+//  MALEDIKE BOT — index.js
+//  Modération complète + Rank/Derank + Blacklist + Keep-Alive
+// ============================================================
+
 const {
-    Client,
-    GatewayIntentBits,
-    Partials,
-    REST,
-    Routes,
-    SlashCommandBuilder,
-    EmbedBuilder,
-    PermissionFlagsBits
-} = require('discord.js');
-const express = require('express');
-const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
+  Client,
+  GatewayIntentBits,
+  Partials,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  EmbedBuilder,
+  PermissionsBitField,
+  Collection,
+  Events,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  AuditLogEvent,
+} = require("discord.js");
+const express = require("express");
+const fetch = require("node-fetch");
 
-// ============================================================
-// VARIABLES D'ENVIRONNEMENT REQUISES (.env ou Render)
-// DISCORD_TOKEN        — Token du bot
-// DISCORD_CLIENT_ID   — ID de l'application
-// DISCORD_GUILD_ID    — ID du serveur
-// ============================================================
+// ─────────────────────────────────────────────
+//  CONFIGURATION — Modifie tout ici directement
+// ─────────────────────────────────────────────
+const CONFIG = {
+  // Token du bot (variable d'environnement sur Render)
+  TOKEN: process.env.TOKEN,
 
-const DATA_DIR = './data';
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+  // ID de l'application Discord
+  CLIENT_ID: process.env.CLIENT_ID,
 
-function loadJSON(file, defaultVal = {}) {
-    const filePath = path.join(DATA_DIR, file);
-    if (!fs.existsSync(filePath)) {
-        fs.writeFileSync(filePath, JSON.stringify(defaultVal, null, 2));
-        return defaultVal;
-    }
-    try {
-        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    } catch {
-        return defaultVal;
-    }
-}
+  // URL Render pour le keep-alive
+  RENDER_URL: "https://hhh-eyls.onrender.com",
 
-function saveJSON(file, data) {
-    fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data, null, 2));
-}
+  // Rôle VIP pouvant derank sans raison (IDs Discord)
+  VIP_ROLES: ["ID_ROLE_VIP_ICI"],
 
-const defaultConfig = {
-    prefix: '?',
-    keepAliveUrl: 'https://hhh-eyls.onrender.com',
-    rankCeilings: {},
-    roleLimits: {
-        rank: {}, derank: {}, disconnect: {}, mute: {}, timeout: {}, kick: {}
-    },
-    protectedRoles: [],
-    vipRoles: [],
-    commandWhitelist: {
-        rank:    { roles: [], users: [] },
-        derank:  { roles: [], users: [] },
-        bl:      { roles: [], users: [] },
-        unbl:    { roles: [], users: [] },
-        blist:   { roles: [], users: [] },
-        blinfo:  { roles: [], users: [] },
-        ban:     { roles: [], users: [] },
-        unban:   { roles: [], users: [] },
-        baninfo: { roles: [], users: [] }
-    },
-    persistenceTracker: {}
+  // Plafond de rank par rôle : { roleID: roleIDplafond }
+  // Exemple : le rôle A peut rank jusqu'au rôle B max
+  RANK_CEILINGS: {
+    // "ID_ROLE_QUI_RANK": "ID_ROLE_PLAFOND_MAX"
+  },
+
+  // Rôles protégés qu'on ne peut pas attribuer sans permission spéciale
+  PROTECTED_ROLES: [
+    // "ID_ROLE_PROTEGE_1", "ID_ROLE_PROTEGE_2"
+  ],
+
+  // Limites d'actions anti-abus par rôle
+  // { roleID: { action: { max: X, window: secondes } } }
+  ROLE_ACTION_LIMITS: {
+    // "ID_ROLE": {
+    //   rank:       { max: 5, window: 300 },
+    //   derank:     { max: 5, window: 300 },
+    //   disconnect: { max: 3, window: 300 },
+    //   mute:       { max: 3, window: 300 },
+    //   timeout:    { max: 3, window: 300 },
+    //   kick:       { max: 2, window: 300 },
+    // }
+  },
+
+  // Whitelist de commandes : { commande: { roles: [], users: [] } }
+  COMMAND_WHITELIST: {
+    rank:    { roles: [], users: [] },
+    derank:  { roles: [], users: [] },
+    ban:     { roles: [], users: [] },
+    unban:   { roles: [], users: [] },
+    baninfo: { roles: [], users: [] },
+    bl:      { roles: [], users: [] },
+    unbl:    { roles: [], users: [] },
+    blist:   { roles: [], users: [] },
+    blinfo:  { roles: [], users: [] },
+    config:  { roles: [], users: [] },
+  },
+
+  // Couleurs des embeds
+  COLORS: {
+    success: 0x2ecc71,
+    error:   0xe74c3c,
+    info:    0x3498db,
+    warn:    0xf39c12,
+    rank:    0x9b59b6,
+    derank:  0xe67e22,
+    ban:     0xc0392b,
+    bl:      0x8e44ad,
+  },
+
+  // Nom du serveur affiché dans les messages
+  SERVER_NAME: "Maledike",
 };
 
-let config    = loadJSON('config.json',     defaultConfig);
-let blacklist = loadJSON('blacklist.json',  {});
-let bans      = loadJSON('bans.json',       {});
-let actionLog = loadJSON('action_log.json', {});
+// ─────────────────────────────────────────────
+//  STOCKAGE EN MÉMOIRE
+// ─────────────────────────────────────────────
+const store = {
+  // blacklist: { userID: { reason, modId, date } }
+  blacklist: new Map(),
 
-function saveConfig()    { saveJSON('config.json',     config); }
-function saveBlacklist() { saveJSON('blacklist.json',  blacklist); }
-function saveBans()      { saveJSON('bans.json',       bans); }
-function saveActionLog() { saveJSON('action_log.json', actionLog); }
+  // bans: { userID: { reason, modId, date } }
+  bans: new Map(),
 
-function mergeDefaults(obj, defaults) {
-    for (const [k, v] of Object.entries(defaults)) {
-        if (obj[k] === undefined) obj[k] = v;
-        else if (v && typeof v === 'object' && !Array.isArray(v)) mergeDefaults(obj[k], v);
-    }
-}
-mergeDefaults(config, defaultConfig);
-saveConfig();
+  // actionLogs anti-abus: { userID: { action: [timestamps...] } }
+  actionLogs: new Map(),
 
-// ============================================================
-// CLIENT DISCORD
-// ============================================================
+  // persistWarnings: { userID: count }
+  persistWarnings: new Map(),
 
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildBans,
-        GatewayIntentBits.DirectMessages
-    ],
-    partials: [Partials.Channel]
-});
+  // configOverrides: stockage des surcharges de config faites en live
+  configOverrides: {},
+};
 
-// ============================================================
-// UTILITAIRES
-// ============================================================
+// ─────────────────────────────────────────────
+//  HELPERS
+// ─────────────────────────────────────────────
 
-function hasPermission(member, commandName) {
-    if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-    const wl = config.commandWhitelist[commandName];
-    if (!wl) return false;
-    if (wl.users.includes(member.id)) return true;
-    return member.roles.cache.some(r => wl.roles.includes(r.id));
+/** Embed générique stylé */
+function embed(color, title, description, fields = []) {
+  const e = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(description)
+    .setTimestamp();
+  if (fields.length) e.addFields(fields);
+  return e;
 }
 
-function checkRateLimit(userId, roleId, action) {
-    const limits = config.roleLimits[action]?.[roleId];
-    if (!limits) return { ok: true };
-    const now = Date.now();
-    const windowMs = limits.window * 60 * 1000;
-    if (!actionLog[userId]) actionLog[userId] = {};
-    if (!actionLog[userId][action]) actionLog[userId][action] = [];
-    actionLog[userId][action] = actionLog[userId][action].filter(t => now - t < windowMs);
-    if (actionLog[userId][action].length >= limits.max) {
-        return { ok: false, max: limits.max, window: limits.window };
-    }
-    actionLog[userId][action].push(now);
-    saveActionLog();
-    return { ok: true };
+/** Récupère le rang hiérarchique d'un membre (plus haut rôle avec position) */
+function topRole(member) {
+  return member.roles.highest;
 }
 
-function getHighestRoleId(member) {
-    return member.roles.cache
-        .filter(r => r.id !== member.guild.id)
-        .sort((a, b) => b.position - a.position)
-        .first()?.id;
+/** Vérifie si un utilisateur a la permission d'utiliser une commande */
+function hasPermission(member, command) {
+  const wl = CONFIG.COMMAND_WHITELIST[command];
+  if (!wl) return true;
+  if (wl.users.includes(member.id)) return true;
+  if (member.roles.cache.some((r) => wl.roles.includes(r.id))) return true;
+  // Admins toujours autorisés
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+  return false;
 }
 
-async function deRankTotal(member, guild) {
-    const manageable = member.roles.cache.filter(r =>
-        r.id !== guild.id && r.managed === false && r.editable
+/** Enregistre une action pour l'anti-abus */
+function logAction(userId, action) {
+  if (!store.actionLogs.has(userId)) store.actionLogs.set(userId, {});
+  const logs = store.actionLogs.get(userId);
+  if (!logs[action]) logs[action] = [];
+  logs[action].push(Date.now());
+}
+
+/** Vérifie si la limite d'actions est dépassée pour un rôle donné */
+function isLimitExceeded(member, action) {
+  for (const [roleId, limits] of Object.entries(CONFIG.ROLE_ACTION_LIMITS)) {
+    if (!member.roles.cache.has(roleId)) continue;
+    const limit = limits[action];
+    if (!limit) continue;
+    const logs = store.actionLogs.get(member.id)?.[action] || [];
+    const windowStart = Date.now() - limit.window * 1000;
+    const recent = logs.filter((t) => t > windowStart);
+    if (recent.length >= limit.max) return true;
+  }
+  return false;
+}
+
+/** Derank total d'un membre (retire tous ses rôles gérables) */
+async function totalDerank(member, reason = "Anti-abus automatique") {
+  try {
+    const manageableRoles = member.roles.cache.filter(
+      (r) => r.id !== member.guild.id && r.editable
     );
-    for (const [, role] of manageable) {
-        await member.roles.remove(role).catch(() => {});
-    }
+    await member.roles.remove(manageableRoles, reason);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-function errorEmbed(msg) {
-    return new EmbedBuilder().setColor(0xED4245).setDescription(`❌ ${msg}`);
-}
-function successEmbed(msg) {
-    return new EmbedBuilder().setColor(0x57F287).setDescription(`✅ ${msg}`);
-}
-function infoEmbed(title, fields = []) {
-    const embed = new EmbedBuilder().setColor(0x5865F2).setTitle(title);
-    if (fields.length) embed.addFields(fields);
-    return embed;
+/** Envoie un MP à un utilisateur */
+async function sendDM(user, content) {
+  try {
+    await user.send(content);
+  } catch {
+    // DMs fermés, on ignore
+  }
 }
 
-async function resolveUserById(idOrMention) {
-    const id = idOrMention?.replace(/[<@!>]/g, '');
-    if (!id) return null;
-    return client.users.fetch(id).catch(() => null);
-}
-async function resolveMember(guild, idOrMention) {
-    const id = idOrMention?.replace(/[<@!>]/g, '');
-    if (!id) return null;
-    return guild.members.fetch(id).catch(() => null);
+/** Cherche un modérateur dans l'audit log */
+async function findModerator(guild, targetId, auditAction) {
+  try {
+    const logs = await guild.fetchAuditLogs({ type: auditAction, limit: 10 });
+    const entry = logs.entries.find(
+      (e) => e.target?.id === targetId && Date.now() - e.createdTimestamp < 10000
+    );
+    if (!entry) return null;
+    return entry.executor;
+  } catch {
+    return null;
+  }
 }
 
-// ============================================================
-// SLASH COMMANDS
-// ============================================================
+/** Vérifie que le rang du bot est supérieur à celui de la cible */
+function botCanManage(botMember, targetMember) {
+  return botMember.roles.highest.comparePositionTo(targetMember.roles.highest) > 0;
+}
 
+/** Vérifie qu'un rôle rank ne dépasse pas son plafond */
+function rankAllowed(rankerMember, roleToGive) {
+  for (const [rankerId, ceilingId] of Object.entries(CONFIG.RANK_CEILINGS)) {
+    if (!rankerMember.roles.cache.has(rankerId)) continue;
+    const ceiling = rankerMember.guild.roles.cache.get(ceilingId);
+    const target  = rankerMember.guild.roles.cache.get(roleToGive.id);
+    if (!ceiling || !target) continue;
+    if (target.comparePositionTo(ceiling) > 0) return false;
+  }
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  CLIENT DISCORD
+// ─────────────────────────────────────────────
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildVoiceStates,
+  ],
+  partials: [Partials.Channel, Partials.Message, Partials.GuildMember, Partials.User],
+});
+
+// ─────────────────────────────────────────────
+//  SLASH COMMANDS — DÉFINITION
+// ─────────────────────────────────────────────
 const slashCommands = [
-    new SlashCommandBuilder()
-        .setName('rank')
-        .setDescription('Attribuer un rôle à un utilisateur')
-        .addUserOption(o => o.setName('user').setDescription('Utilisateur cible').setRequired(true))
-        .addRoleOption(o => o.setName('role').setDescription('Rôle à attribuer').setRequired(true)),
+  // /rank
+  new SlashCommandBuilder()
+    .setName("rank")
+    .setDescription("Attribue un rôle à un membre")
+    .addUserOption((o) => o.setName("user").setDescription("Membre cible").setRequired(true))
+    .addRoleOption((o) => o.setName("role").setDescription("Rôle à attribuer").setRequired(true)),
 
-    new SlashCommandBuilder()
-        .setName('derank')
-        .setDescription('Retirer un rôle à un utilisateur')
-        .addUserOption(o => o.setName('user').setDescription('Utilisateur cible').setRequired(true))
-        .addRoleOption(o => o.setName('role').setDescription('Rôle à retirer (optionnel pour VIP)').setRequired(false))
-        .addStringOption(o => o.setName('raison').setDescription('Raison du derank').setRequired(false))
-];
+  // /derank
+  new SlashCommandBuilder()
+    .setName("derank")
+    .setDescription("Retire un rôle à un membre")
+    .addUserOption((o) => o.setName("user").setDescription("Membre cible").setRequired(true))
+    .addRoleOption((o) => o.setName("role").setDescription("Rôle à retirer").setRequired(false))
+    .addStringOption((o) => o.setName("raison").setDescription("Raison du derank").setRequired(false)),
 
+  // /config (admin)
+  new SlashCommandBuilder()
+    .setName("config")
+    .setDescription("Configure le bot en live")
+    .addStringOption((o) =>
+      o.setName("action")
+        .setDescription("Action de configuration")
+        .setRequired(true)
+        .addChoices(
+          { name: "Ajouter rôle whitelist", value: "add_whitelist_role" },
+          { name: "Retirer rôle whitelist", value: "remove_whitelist_role" },
+          { name: "Ajouter rôle protégé", value: "add_protected" },
+          { name: "Retirer rôle protégé", value: "remove_protected" },
+          { name: "Définir plafond rank", value: "set_ceiling" },
+          { name: "Ajouter rôle VIP derank", value: "add_vip" },
+          { name: "Voir la config actuelle", value: "show" }
+        )
+    )
+    .addStringOption((o) => o.setName("commande").setDescription("Commande concernée").setRequired(false))
+    .addRoleOption((o) => o.setName("role").setDescription("Rôle concerné").setRequired(false))
+    .addRoleOption((o) => o.setName("role2").setDescription("Rôle secondaire (plafond)").setRequired(false)),
+].map((c) => c.toJSON());
+
+// ─────────────────────────────────────────────
+//  ENREGISTREMENT DES SLASH COMMANDS
+// ─────────────────────────────────────────────
 async function registerSlashCommands() {
-    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    try {
-        await rest.put(
-            Routes.applicationGuildCommands(
-                process.env.DISCORD_CLIENT_ID,
-                process.env.DISCORD_GUILD_ID
-            ),
-            { body: slashCommands.map(c => c.toJSON()) }
-        );
-        console.log('✅ Slash commands enregistrées avec succès.');
-    } catch (err) {
-        console.error('❌ Erreur enregistrement slash commands:', err);
-    }
+  if (!CONFIG.CLIENT_ID || !CONFIG.TOKEN) return;
+  try {
+    const rest = new REST({ version: "10" }).setToken(CONFIG.TOKEN);
+    await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), { body: slashCommands });
+    console.log("✅ Slash commands enregistrées.");
+  } catch (err) {
+    console.error("❌ Erreur enregistrement slash commands:", err.message);
+  }
 }
 
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-    const { commandName, member, guild } = interaction;
-
-    // ── /rank ──────────────────────────────────────────────
-    if (commandName === 'rank') {
-        if (!hasPermission(member, 'rank')) {
-            return interaction.reply({ embeds: [errorEmbed('Vous n\'avez pas la permission d\'utiliser cette commande.')], ephemeral: true });
-        }
-        const targetUser = interaction.options.getUser('user');
-        const role = interaction.options.getRole('role');
-        const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
-        if (!targetMember) return interaction.reply({ embeds: [errorEmbed('Utilisateur introuvable sur le serveur.')], ephemeral: true });
-
-        if (config.protectedRoles.includes(role.id)) {
-            const key = `${member.id}_protected`;
-            config.persistenceTracker[key] = (config.persistenceTracker[key] || 0) + 1;
-            saveConfig();
-            if (config.persistenceTracker[key] > 1) {
-                await deRankTotal(member, guild);
-                try { await member.send('Vous avez été derank sur Maledike pour avoir persisté à attribuer un rôle protégé.'); } catch {}
-                delete config.persistenceTracker[key];
-                saveConfig();
-                return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`${member} a été entièrement derank pour avoir persisté à attribuer un rôle protégé.`)] });
-            }
-            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xED4245).setDescription(`${member} Vous n'avez pas l'autorisation d'attribuer un rôle protégé.`)] });
-        }
-
-        const executorTopRoleId = getHighestRoleId(member);
-        const ceilingRoleId = config.rankCeilings[executorTopRoleId];
-        if (ceilingRoleId) {
-            const ceilingRole = guild.roles.cache.get(ceilingRoleId);
-            if (ceilingRole && role.position >= ceilingRole.position) {
-                return interaction.reply({ embeds: [errorEmbed(`Votre plafond maximum est <@&${ceilingRoleId}>. Vous ne pouvez pas attribuer un rôle supérieur ou égal.`)], ephemeral: true });
-            }
-        }
-
-        const limit = checkRateLimit(member.id, executorTopRoleId, 'rank');
-        if (!limit.ok) {
-            return interaction.reply({ embeds: [errorEmbed(`Limite de ranks atteinte (${limit.max} fois en ${limit.window} min). Réessayez plus tard.`)], ephemeral: true });
-        }
-
-        await targetMember.roles.add(role).catch(() => {});
-        return interaction.reply({ embeds: [infoEmbed('🏅 Rank', [
-            { name: 'Utilisateur', value: `${targetMember}`, inline: true },
-            { name: 'Rôle attribué', value: `${role}`, inline: true },
-            { name: 'Par', value: `${member}`, inline: true }
-        ])] });
-    }
-
-    // ── /derank ────────────────────────────────────────────
-    if (commandName === 'derank') {
-        if (!hasPermission(member, 'derank')) {
-            return interaction.reply({ embeds: [errorEmbed('Vous n\'avez pas la permission d\'utiliser cette commande.')], ephemeral: true });
-        }
-        const targetUser = interaction.options.getUser('user');
-        const role = interaction.options.getRole('role');
-        const raison = interaction.options.getString('raison');
-        const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
-        if (!targetMember) return interaction.reply({ embeds: [errorEmbed('Utilisateur introuvable sur le serveur.')], ephemeral: true });
-
-        const isVip = member.roles.cache.some(r => config.vipRoles.includes(r.id));
-        if (!isVip && !raison) {
-            return interaction.reply({ embeds: [errorEmbed('Une raison est obligatoire pour effectuer un derank. (Option `raison`)')], ephemeral: true });
-        }
-
-        if (role) {
-            await targetMember.roles.remove(role).catch(() => {});
-            return interaction.reply({ embeds: [infoEmbed('🔻 Derank', [
-                { name: 'Utilisateur', value: `${targetMember}`, inline: true },
-                { name: 'Rôle retiré', value: `${role}`, inline: true },
-                { name: 'Raison', value: raison || '—', inline: false },
-                { name: 'Par', value: `${member}`, inline: true }
-            ])] });
-        } else {
-            if (!isVip) return interaction.reply({ embeds: [errorEmbed('Spécifiez un rôle à retirer. Le derank total est réservé aux rôles VIP.')], ephemeral: true });
-            await deRankTotal(targetMember, guild);
-            return interaction.reply({ embeds: [infoEmbed('🔻 Derank Total', [
-                { name: 'Utilisateur', value: `${targetMember}`, inline: true },
-                { name: 'Par', value: `${member}`, inline: true }
-            ])] });
-        }
-    }
+// ─────────────────────────────────────────────
+//  EVENT : READY
+// ─────────────────────────────────────────────
+client.once(Events.ClientReady, async () => {
+  console.log(`✅ Bot connecté en tant que ${client.user.tag}`);
+  await registerSlashCommands();
+  startKeepAlive();
 });
 
-// ============================================================
-// COMMANDES PRÉFIXE
-// ============================================================
+// ─────────────────────────────────────────────
+//  EVENT : GUILD MEMBER ADD — Blacklist check
+// ─────────────────────────────────────────────
+client.on(Events.GuildMemberAdd, async (member) => {
+  const bl = store.blacklist.get(member.id);
+  if (!bl) return;
 
-client.on('messageCreate', async message => {
-    if (message.author.bot || !message.guild) return;
-    const prefix = config.prefix;
-    if (!message.content.startsWith(prefix)) return;
+  await sendDM(
+    member.user,
+    `> ⛔ **Vous avez été blacklisté de ${CONFIG.SERVER_NAME}.**\n> **Raison :** ${bl.reason}`
+  );
 
-    const args = message.content.slice(prefix.length).trim().split(/\s+/);
-    const cmd = args.shift().toLowerCase();
-    const { guild, member } = message;
-
-    // ── ?bl ────────────────────────────────────────────────
-    if (cmd === 'bl') {
-        if (!hasPermission(member, 'bl')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        if (!args[0]) return message.reply({ embeds: [errorEmbed('Usage: `?bl @user/ID [raison]`')] });
-        const targetMember = await resolveMember(guild, args[0]);
-        const targetUser = targetMember?.user ?? await resolveUserById(args[0]);
-        if (!targetUser) return message.reply({ embeds: [errorEmbed('Utilisateur introuvable.')] });
-        const userId = targetUser.id;
-        const raison = args.slice(1).join(' ') || 'Aucune raison fournie';
-        blacklist[userId] = { reason: raison, moderator: member.id, moderatorTag: member.user.tag, target: userId, targetTag: targetUser.tag, date: new Date().toISOString() };
-        saveBlacklist();
-        if (targetMember) {
-            try { await targetMember.send(`Vous avez été blacklisté de Maledike. Raison : ${raison}`); } catch {}
-            await targetMember.kick(`Blacklist : ${raison}`).catch(() => {});
-        }
-        return message.reply({ embeds: [infoEmbed('⛔ Blacklist', [
-            { name: 'Cible', value: `<@${userId}> (${targetUser.tag})`, inline: true },
-            { name: 'Raison', value: raison, inline: false },
-            { name: 'Modérateur', value: `<@${member.id}>`, inline: true },
-            { name: 'Date', value: new Date().toLocaleString('fr-FR'), inline: true }
-        ])] });
-    }
-
-    // ── ?unbl ──────────────────────────────────────────────
-    if (cmd === 'unbl') {
-        if (!hasPermission(member, 'unbl')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        const id = args[0]?.replace(/[<@!>]/g, '');
-        if (!id) return message.reply({ embeds: [errorEmbed('Usage: `?unbl @user/ID`')] });
-        if (!blacklist[id]) return message.reply({ embeds: [errorEmbed('Cet utilisateur n\'est pas blacklisté.')] });
-        delete blacklist[id];
-        saveBlacklist();
-        return message.reply({ embeds: [successEmbed(`<@${id}> a été retiré de la blacklist.`)] });
-    }
-
-    // ── ?blist ─────────────────────────────────────────────
-    if (cmd === 'blist') {
-        if (!hasPermission(member, 'blist')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        const entries = Object.entries(blacklist);
-        if (entries.length === 0) return message.reply({ embeds: [infoEmbed('📋 Blacklist vide', [{ name: 'Aucune entrée', value: 'Personne n\'est blacklisté.' }])] });
-        const lines = entries.map(([id, d]) => `• <@${id}> **(${d.targetTag || '?'})** — ${d.reason} *(par <@${d.moderator}>)*`);
-        return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle(`📋 Blacklist (${entries.length})`).setDescription(lines.join('\n').slice(0, 4000))] });
-    }
-
-    // ── ?blinfo ────────────────────────────────────────────
-    if (cmd === 'blinfo') {
-        if (!hasPermission(member, 'blinfo')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        const id = args[0]?.replace(/[<@!>]/g, '');
-        if (!id) return message.reply({ embeds: [errorEmbed('Usage: `?blinfo @user/ID`')] });
-        const data = blacklist[id];
-        if (!data) return message.reply({ embeds: [errorEmbed('Aucune entrée blacklist pour cet utilisateur.')] });
-        return message.reply({ embeds: [infoEmbed('⛔ Blacklist Info', [
-            { name: 'Cible', value: `<@${data.target}> (${data.targetTag || '?'})`, inline: true },
-            { name: 'Modérateur', value: data.moderator ? `<@${data.moderator}>` : '🔴', inline: true },
-            { name: 'Raison', value: data.reason, inline: false },
-            { name: 'Date', value: new Date(data.date).toLocaleString('fr-FR'), inline: true }
-        ])] });
-    }
-
-    // ── ?ban ───────────────────────────────────────────────
-    if (cmd === 'ban') {
-        if (!hasPermission(member, 'ban')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        if (!args[0]) return message.reply({ embeds: [errorEmbed('Usage: `?ban @user/ID [raison]`')] });
-        const targetMember = await resolveMember(guild, args[0]);
-        const targetUser = targetMember?.user ?? await resolveUserById(args[0]);
-        if (!targetUser) return message.reply({ embeds: [errorEmbed('Utilisateur introuvable.')] });
-        const userId = targetUser.id;
-        const raison = args.slice(1).join(' ') || 'Aucune raison fournie';
-        bans[userId] = { reason: raison, moderator: member.id, moderatorTag: member.user.tag, target: userId, targetTag: targetUser.tag, date: new Date().toISOString() };
-        saveBans();
-        await guild.members.ban(userId, { reason: raison }).catch(() => {});
-        return message.reply({ embeds: [infoEmbed('🔨 Ban', [
-            { name: 'Cible', value: `<@${userId}> (${targetUser.tag})`, inline: true },
-            { name: 'Raison', value: raison, inline: false },
-            { name: 'Modérateur', value: `<@${member.id}>`, inline: true },
-            { name: 'Date', value: new Date().toLocaleString('fr-FR'), inline: true }
-        ])] });
-    }
-
-    // ── ?unban ─────────────────────────────────────────────
-    if (cmd === 'unban') {
-        if (!hasPermission(member, 'unban')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        const id = args[0]?.replace(/[<@!>]/g, '');
-        if (!id) return message.reply({ embeds: [errorEmbed('Usage: `?unban @user/ID`')] });
-        await guild.bans.remove(id).catch(() => {});
-        delete bans[id];
-        saveBans();
-        return message.reply({ embeds: [successEmbed(`<@${id}> a été unban.`)] });
-    }
-
-    // ── ?baninfo ───────────────────────────────────────────
-    if (cmd === 'baninfo') {
-        if (!hasPermission(member, 'baninfo')) return message.reply({ embeds: [errorEmbed('Permission refusée.')] });
-        const id = args[0]?.replace(/[<@!>]/g, '');
-        if (!id) return message.reply({ embeds: [errorEmbed('Usage: `?baninfo @user/ID`')] });
-        const data = bans[id];
-        if (!data) return message.reply({ embeds: [errorEmbed('Aucun ban enregistré pour cet utilisateur.')] });
-        return message.reply({ embeds: [infoEmbed('🔨 Ban Info', [
-            { name: 'Cible', value: `<@${data.target}> (${data.targetTag || '?'})`, inline: true },
-            { name: 'Modérateur', value: data.moderator ? `<@${data.moderator}>` : '🔴', inline: true },
-            { name: 'Raison', value: data.reason, inline: false },
-            { name: 'Date', value: new Date(data.date).toLocaleString('fr-FR'), inline: true }
-        ])] });
-    }
-
-    // ── ?config (Admin seulement) ──────────────────────────
-    if (cmd === 'config') {
-        if (!member.permissions.has(PermissionFlagsBits.Administrator)) {
-            return message.reply({ embeds: [errorEmbed('Commande réservée aux administrateurs.')] });
-        }
-        const sub = args[0];
-
-        if (sub === 'setceiling') {
-            const roleId = args[1]?.replace(/[<@&>]/g, '');
-            const ceilingId = args[2]?.replace(/[<@&>]/g, '');
-            if (!roleId || !ceilingId) return message.reply({ embeds: [errorEmbed('Usage: `?config setceiling @role @rolePlafond`')] });
-            config.rankCeilings[roleId] = ceilingId;
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`Plafond défini : <@&${roleId}> peut rank jusqu'à <@&${ceilingId}> (exclu).`)] });
-        }
-
-        if (sub === 'setlimit') {
-            const action = args[1];
-            const roleId = args[2]?.replace(/[<@&>]/g, '');
-            const max = parseInt(args[3]);
-            const win = parseInt(args[4]);
-            if (!action || !roleId || isNaN(max) || isNaN(win)) return message.reply({ embeds: [errorEmbed('Usage: `?config setlimit <action> @role <max> <minutes>`')] });
-            if (!config.roleLimits[action]) config.roleLimits[action] = {};
-            config.roleLimits[action][roleId] = { max, window: win };
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`Limite pour **${action}** sur <@&${roleId}> : ${max} fois en ${win} min.`)] });
-        }
-
-        if (sub === 'protect') {
-            const roleId = args[1]?.replace(/[<@&>]/g, '');
-            if (!roleId) return message.reply({ embeds: [errorEmbed('Usage: `?config protect @role`')] });
-            if (!config.protectedRoles.includes(roleId)) config.protectedRoles.push(roleId);
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`<@&${roleId}> est maintenant un rôle protégé.`)] });
-        }
-
-        if (sub === 'unprotect') {
-            const roleId = args[1]?.replace(/[<@&>]/g, '');
-            config.protectedRoles = config.protectedRoles.filter(r => r !== roleId);
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`<@&${roleId}> n'est plus protégé.`)] });
-        }
-
-        if (sub === 'setvip') {
-            const roleId = args[1]?.replace(/[<@&>]/g, '');
-            if (!roleId) return message.reply({ embeds: [errorEmbed('Usage: `?config setvip @role`')] });
-            if (!config.vipRoles.includes(roleId)) config.vipRoles.push(roleId);
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`<@&${roleId}> est maintenant VIP (peut derank sans raison).`)] });
-        }
-
-        if (sub === 'unsetvip') {
-            const roleId = args[1]?.replace(/[<@&>]/g, '');
-            config.vipRoles = config.vipRoles.filter(r => r !== roleId);
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`<@&${roleId}> n'est plus VIP.`)] });
-        }
-
-        if (sub === 'whitelist') {
-            const cmdName = args[1];
-            const type = args[2];
-            const id = args[3]?.replace(/[<@!&>]/g, '');
-            if (!cmdName || !type || !id) return message.reply({ embeds: [errorEmbed('Usage: `?config whitelist <commande> role|user @mention`')] });
-            if (!config.commandWhitelist[cmdName]) config.commandWhitelist[cmdName] = { roles: [], users: [] };
-            if (type === 'role' && !config.commandWhitelist[cmdName].roles.includes(id)) config.commandWhitelist[cmdName].roles.push(id);
-            else if (type === 'user' && !config.commandWhitelist[cmdName].users.includes(id)) config.commandWhitelist[cmdName].users.push(id);
-            saveConfig();
-            return message.reply({ embeds: [successEmbed(`Whitelist mise à jour pour la commande **${cmdName}**.`)] });
-        }
-
-        if (sub === 'unwhitelist') {
-            const cmdName = args[1];
-            const type = args[2];
-            const id = args[3]?.replace(/[<@!&>]/g, '');
-            if (config.commandWhitelist[cmdName]) {
-                if (type === 'role') config.commandWhitelist[cmdName].roles = config.commandWhitelist[cmdName].roles.filter(r => r !== id);
-                if (type === 'user') config.commandWhitelist[cmdName].users = config.commandWhitelist[cmdName].users.filter(u => u !== id);
-                saveConfig();
-            }
-            return message.reply({ embeds: [successEmbed(`Whitelist mise à jour pour la commande **${cmdName}**.`)] });
-        }
-
-        if (sub === 'info') {
-            return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⚙️ Configuration du Bot').addFields(
-                { name: 'Préfixe', value: config.prefix, inline: true },
-                { name: 'Rôles protégés', value: config.protectedRoles.map(r => `<@&${r}>`).join(', ') || 'Aucun', inline: false },
-                { name: 'Rôles VIP', value: config.vipRoles.map(r => `<@&${r}>`).join(', ') || 'Aucun', inline: false },
-                { name: 'Plafonds de rank', value: Object.entries(config.rankCeilings).map(([r, c]) => `<@&${r}> → max <@&${c}>`).join('\n') || 'Aucun', inline: false }
-            )] });
-        }
-
-        return message.reply({ embeds: [infoEmbed('⚙️ Config — Aide', [
-            { name: 'Plafond de rank', value: '`?config setceiling @role @rolePlafond`', inline: false },
-            { name: 'Limite d\'actions', value: '`?config setlimit <action> @role <max> <minutes>`', inline: false },
-            { name: 'Protéger un rôle', value: '`?config protect @role` / `?config unprotect @role`', inline: false },
-            { name: 'Rôle VIP', value: '`?config setvip @role` / `?config unsetvip @role`', inline: false },
-            { name: 'Whitelist commande', value: '`?config whitelist <cmd> role|user @mention`', inline: false },
-            { name: 'Retirer whitelist', value: '`?config unwhitelist <cmd> role|user @mention`', inline: false },
-            { name: 'Voir la config', value: '`?config info`', inline: false }
-        ])] });
-    }
+  try {
+    await member.kick(`[Blacklist] ${bl.reason}`);
+  } catch {
+    console.error(`Impossible de kick le membre blacklisté ${member.id}`);
+  }
 });
 
-// ============================================================
-// AUTO-KICK DES MEMBRES BLACKLISTÉS À LEUR ARRIVÉE
-// ============================================================
+// ─────────────────────────────────────────────
+//  SLASH COMMAND HANDLER
+// ─────────────────────────────────────────────
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-client.on('guildMemberAdd', async member => {
-    const data = blacklist[member.id];
-    if (!data) return;
-    try { await member.send(`Vous avez été blacklisté de Maledike. Raison : ${data.reason}`); } catch {}
-    await member.kick(`Blacklisté : ${data.reason}`).catch(() => {});
+  const { commandName, member, guild } = interaction;
+
+  // ── /rank ──
+  if (commandName === "rank") {
+    if (!hasPermission(member, "rank")) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Vous n'avez pas la permission d'utiliser `/rank`.")],
+        ephemeral: true,
+      });
+    }
+
+    const targetUser = interaction.options.getUser("user");
+    const role = interaction.options.getRole("role");
+    const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+
+    if (!targetMember) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Membre introuvable", "Ce membre n'est pas sur le serveur.")],
+        ephemeral: true,
+      });
+    }
+
+    // Vérif rôle protégé
+    if (CONFIG.PROTECTED_ROLES.includes(role.id)) {
+      // Avertissement anti-persist
+      const warns = (store.persistWarnings.get(member.id) || 0) + 1;
+      store.persistWarnings.set(member.id, warns);
+
+      if (warns >= 2) {
+        await totalDerank(member, "Persistance sur rôle protégé");
+        await sendDM(
+          member.user,
+          `> ⚠️ Vous avez été **derank totalement** sur **${CONFIG.SERVER_NAME}** pour avoir persisté à attribuer un rôle protégé.`
+        );
+        store.persistWarnings.delete(member.id);
+        return interaction.reply({
+          embeds: [embed(CONFIG.COLORS.error, "⛔ Derank automatique", `${member} a été derank totalement pour persistance sur un rôle protégé.`)],
+        });
+      }
+
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "🛡️ Rôle protégé", `${member} Vous n'avez pas l'autorisation d'attribuer un rôle protégé.`)],
+      });
+    }
+
+    // Vérif plafond
+    if (!rankAllowed(member, role)) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "🚫 Dépassement de plafond", `Vous ne pouvez pas attribuer un rôle supérieur à votre plafond autorisé.`)],
+        ephemeral: true,
+      });
+    }
+
+    // Anti-abus
+    if (isLimitExceeded(member, "rank")) {
+      await totalDerank(member, "Dépassement limite rank");
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "⚠️ Limite dépassée", `${member} a dépassé la limite de ranks. Derank total appliqué.`)],
+      });
+    }
+    logAction(member.id, "rank");
+
+    // Attribution
+    try {
+      await targetMember.roles.add(role, `Rank par ${member.user.tag}`);
+      return interaction.reply({
+        embeds: [
+          embed(CONFIG.COLORS.rank, "✅ Rôle attribué", `Le rôle ${role} a été attribué à ${targetMember}.`, [
+            { name: "👤 Exécuteur", value: `${member}`, inline: true },
+            { name: "🎯 Cible", value: `${targetMember}`, inline: true },
+            { name: "🏷️ Rôle", value: `${role}`, inline: true },
+          ]),
+        ],
+      });
+    } catch (err) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Erreur", `Impossible d'attribuer ce rôle : \`${err.message}\``)],
+        ephemeral: true,
+      });
+    }
+  }
+
+  // ── /derank ──
+  if (commandName === "derank") {
+    if (!hasPermission(member, "derank")) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Vous n'avez pas la permission d'utiliser `/derank`.")],
+        ephemeral: true,
+      });
+    }
+
+    const targetUser = interaction.options.getUser("user");
+    const role = interaction.options.getRole("role");
+    const raison = interaction.options.getString("raison");
+    const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+
+    if (!targetMember) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Membre introuvable", "Ce membre n'est pas sur le serveur.")],
+        ephemeral: true,
+      });
+    }
+
+    // VIP : peut derank sans raison et sans rôle spécifique (derank total)
+    const isVIP = member.roles.cache.some((r) => CONFIG.VIP_ROLES.includes(r.id));
+
+    if (!isVIP && !raison) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "📝 Raison requise", "Vous devez fournir une raison pour effectuer un derank.")],
+        ephemeral: true,
+      });
+    }
+
+    // Anti-abus
+    if (isLimitExceeded(member, "derank")) {
+      await totalDerank(member, "Dépassement limite derank");
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "⚠️ Limite dépassée", `${member} a dépassé la limite de deranks. Derank total appliqué.`)],
+      });
+    }
+    logAction(member.id, "derank");
+
+    try {
+      if (role) {
+        await targetMember.roles.remove(role, raison || "Derank VIP");
+        return interaction.reply({
+          embeds: [
+            embed(CONFIG.COLORS.derank, "🔻 Rôle retiré", `Le rôle ${role} a été retiré à ${targetMember}.`, [
+              { name: "👤 Exécuteur", value: `${member}`, inline: true },
+              { name: "🎯 Cible", value: `${targetMember}`, inline: true },
+              { name: "🏷️ Rôle", value: `${role}`, inline: true },
+              { name: "📝 Raison", value: raison || "Aucune (VIP)", inline: false },
+            ]),
+          ],
+        });
+      } else {
+        // Derank total (VIP seulement possible sans role)
+        if (!isVIP) {
+          return interaction.reply({
+            embeds: [embed(CONFIG.COLORS.error, "❌ Précisez un rôle", "Veuillez préciser le rôle à retirer.")],
+            ephemeral: true,
+          });
+        }
+        await totalDerank(targetMember, raison || "Derank total VIP");
+        return interaction.reply({
+          embeds: [
+            embed(CONFIG.COLORS.derank, "🔻 Derank total", `${targetMember} a été derank totalement.`, [
+              { name: "👤 Exécuteur", value: `${member}`, inline: true },
+              { name: "🎯 Cible", value: `${targetMember}`, inline: true },
+            ]),
+          ],
+        });
+      }
+    } catch (err) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Erreur", `Impossible de retirer ce rôle : \`${err.message}\``)],
+        ephemeral: true,
+      });
+    }
+  }
+
+  // ── /config ──
+  if (commandName === "config") {
+    if (!hasPermission(member, "config")) {
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Vous n'avez pas la permission de configurer le bot.")],
+        ephemeral: true,
+      });
+    }
+
+    const action = interaction.options.getString("action");
+    const role   = interaction.options.getRole("role");
+    const role2  = interaction.options.getRole("role2");
+    const cmd    = interaction.options.getString("commande");
+
+    if (action === "show") {
+      const desc = [
+        `**Rôles VIP :** ${CONFIG.VIP_ROLES.map((id) => `<@&${id}>`).join(", ") || "Aucun"}`,
+        `**Rôles protégés :** ${CONFIG.PROTECTED_ROLES.map((id) => `<@&${id}>`).join(", ") || "Aucun"}`,
+        `**Plafonds rank :** ${Object.entries(CONFIG.RANK_CEILINGS).map(([k, v]) => `<@&${k}> → <@&${v}>`).join(", ") || "Aucun"}`,
+      ].join("\n");
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.info, "⚙️ Configuration actuelle", desc)],
+        ephemeral: true,
+      });
+    }
+
+    if (action === "add_whitelist_role" && cmd && role) {
+      if (!CONFIG.COMMAND_WHITELIST[cmd]) CONFIG.COMMAND_WHITELIST[cmd] = { roles: [], users: [] };
+      if (!CONFIG.COMMAND_WHITELIST[cmd].roles.includes(role.id)) {
+        CONFIG.COMMAND_WHITELIST[cmd].roles.push(role.id);
+      }
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.success, "✅ Whitelist mise à jour", `${role} peut maintenant utiliser \`/${cmd}\`.`)],
+        ephemeral: true,
+      });
+    }
+
+    if (action === "remove_whitelist_role" && cmd && role) {
+      if (CONFIG.COMMAND_WHITELIST[cmd]) {
+        CONFIG.COMMAND_WHITELIST[cmd].roles = CONFIG.COMMAND_WHITELIST[cmd].roles.filter((id) => id !== role.id);
+      }
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.success, "✅ Whitelist mise à jour", `${role} ne peut plus utiliser \`/${cmd}\`.`)],
+        ephemeral: true,
+      });
+    }
+
+    if (action === "add_protected" && role) {
+      if (!CONFIG.PROTECTED_ROLES.includes(role.id)) CONFIG.PROTECTED_ROLES.push(role.id);
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.success, "🛡️ Rôle protégé ajouté", `${role} est maintenant protégé.`)],
+        ephemeral: true,
+      });
+    }
+
+    if (action === "remove_protected" && role) {
+      const i = CONFIG.PROTECTED_ROLES.indexOf(role.id);
+      if (i > -1) CONFIG.PROTECTED_ROLES.splice(i, 1);
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.success, "🛡️ Protection retirée", `${role} n'est plus protégé.`)],
+        ephemeral: true,
+      });
+    }
+
+    if (action === "set_ceiling" && role && role2) {
+      CONFIG.RANK_CEILINGS[role.id] = role2.id;
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.success, "🏔️ Plafond défini", `Le rôle ${role} peut désormais rank jusqu'au maximum ${role2}.`)],
+        ephemeral: true,
+      });
+    }
+
+    if (action === "add_vip" && role) {
+      if (!CONFIG.VIP_ROLES.includes(role.id)) CONFIG.VIP_ROLES.push(role.id);
+      return interaction.reply({
+        embeds: [embed(CONFIG.COLORS.success, "⭐ Rôle VIP ajouté", `${role} peut désormais derank sans raison.`)],
+        ephemeral: true,
+      });
+    }
+
+    return interaction.reply({
+      embeds: [embed(CONFIG.COLORS.warn, "⚠️ Action incomplète", "Veuillez renseigner tous les paramètres nécessaires.")],
+      ephemeral: true,
+    });
+  }
 });
 
-// ============================================================
-// SERVEUR KEEP-ALIVE
-// ============================================================
+// ─────────────────────────────────────────────
+//  PREFIX COMMAND HANDLER (?, !)
+// ─────────────────────────────────────────────
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.guild) return;
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+  const content = message.content.trim();
+  const PREFIX  = "?";
+  if (!content.startsWith(PREFIX)) return;
 
-app.get('/', (req, res) => res.send('✅ Bot Maledike en ligne.'));
-app.listen(PORT, () => console.log(`✅ Serveur keep-alive sur le port ${PORT}`));
+  const args    = content.slice(PREFIX.length).trim().split(/\s+/);
+  const command = args.shift().toLowerCase();
+  const guild   = message.guild;
+  const member  = message.member;
 
-setInterval(async () => {
-    try { await fetch(config.keepAliveUrl); } catch {}
-}, 60_000);
+  // ── ?ban ──
+  if (command === "ban") {
+    if (!hasPermission(member, "ban")) {
+      return message.reply({
+        embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Vous n'avez pas la permission d'utiliser `?ban`.")],
+      });
+    }
 
-// ============================================================
-// CONNEXION DU BOT
-// ============================================================
+    const targetId = args[0]?.replace(/[<@!>]/g, "");
+    const raison   = args.slice(1).join(" ") || "Aucune raison fournie";
+    if (!targetId) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Usage", "`?ban @user/ID [raison]`")] });
 
-client.once('ready', async () => {
-    console.log(`✅ Connecté en tant que ${client.user.tag}`);
-    await registerSlashCommands();
+    const targetUser = await client.users.fetch(targetId).catch(() => null);
+    if (!targetUser) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Utilisateur introuvable", "Impossible de trouver cet utilisateur.")] });
+
+    try {
+      await guild.bans.create(targetId, { reason: raison, deleteMessageSeconds: 604800 });
+      store.bans.set(targetId, { reason: raison, modId: member.id, date: new Date().toISOString() });
+      return message.reply({
+        embeds: [
+          embed(CONFIG.COLORS.ban, "🔨 Banni", `${targetUser.tag} a été banni du serveur.`, [
+            { name: "👤 Exécuteur", value: `${member}`, inline: true },
+            { name: "🎯 Cible", value: `${targetUser.tag} (${targetId})`, inline: true },
+            { name: "📝 Raison", value: raison, inline: false },
+          ]),
+        ],
+      });
+    } catch (err) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Erreur", `Impossible de bannir : \`${err.message}\``)] });
+    }
+  }
+
+  // ── ?unban ──
+  if (command === "unban") {
+    if (!hasPermission(member, "unban")) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Permission refusée.")] });
+    }
+
+    const targetId = args[0]?.replace(/[<@!>]/g, "");
+    if (!targetId) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Usage", "`?unban @user/ID`")] });
+
+    try {
+      await guild.bans.remove(targetId);
+      store.bans.delete(targetId);
+      return message.reply({ embeds: [embed(CONFIG.COLORS.success, "✅ Débanni", `L'utilisateur \`${targetId}\` a été débanni.`)] });
+    } catch (err) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Erreur", `Impossible de débannir : \`${err.message}\``)] });
+    }
+  }
+
+  // ── ?baninfo ──
+  if (command === "baninfo") {
+    if (!hasPermission(member, "baninfo")) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Permission refusée.")] });
+    }
+
+    const targetId = args[0]?.replace(/[<@!>]/g, "");
+    if (!targetId) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Usage", "`?baninfo @user/ID`")] });
+
+    const banData = store.bans.get(targetId);
+    let guildBan;
+    try {
+      guildBan = await guild.bans.fetch(targetId);
+    } catch {
+      guildBan = null;
+    }
+
+    if (!banData && !guildBan) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.info, "ℹ️ Aucun ban", "Cet utilisateur n'est pas banni.")] });
+    }
+
+    const targetUser = await client.users.fetch(targetId).catch(() => null);
+    let modDisplay = "🔴 Modérateur introuvable";
+    if (banData?.modId) {
+      const mod = await client.users.fetch(banData.modId).catch(() => null);
+      modDisplay = mod ? `${mod.tag} (${mod.id})` : "🔴 Introuvable";
+    }
+
+    return message.reply({
+      embeds: [
+        embed(CONFIG.COLORS.ban, "📋 Informations du ban", `Détails pour \`${targetUser?.tag || targetId}\``, [
+          { name: "🎯 Cible", value: targetUser ? `${targetUser.tag} (${targetId})` : targetId, inline: true },
+          { name: "👮 Modérateur", value: modDisplay, inline: true },
+          { name: "📝 Raison", value: banData?.reason || guildBan?.reason || "Inconnue", inline: false },
+          { name: "📅 Date", value: banData?.date ? `<t:${Math.floor(new Date(banData.date).getTime() / 1000)}:F>` : "Inconnue", inline: false },
+        ]),
+      ],
+    });
+  }
+
+  // ── ?bl ──
+  if (command === "bl") {
+    if (!hasPermission(member, "bl")) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Permission refusée.")] });
+    }
+
+    const targetId = args[0]?.replace(/[<@!>]/g, "");
+    const raison   = args.slice(1).join(" ") || "Aucune raison fournie";
+    if (!targetId) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Usage", "`?bl @user/ID [raison]`")] });
+
+    const targetUser = await client.users.fetch(targetId).catch(() => null);
+    store.blacklist.set(targetId, { reason: raison, modId: member.id, date: new Date().toISOString() });
+
+    // Kick s'il est présent sur le serveur
+    const targetMember = await guild.members.fetch(targetId).catch(() => null);
+    if (targetMember) {
+      await sendDM(
+        targetMember.user,
+        `> ⛔ **Vous avez été blacklisté de ${CONFIG.SERVER_NAME}.**\n> **Raison :** ${raison}`
+      );
+      try { await targetMember.kick(`[Blacklist] ${raison}`); } catch {}
+    }
+
+    return message.reply({
+      embeds: [
+        embed(CONFIG.COLORS.bl, "⛔ Blacklisté", `${targetUser?.tag || targetId} a été blacklisté.`, [
+          { name: "👤 Exécuteur", value: `${member}`, inline: true },
+          { name: "🎯 Cible", value: targetUser ? `${targetUser.tag} (${targetId})` : targetId, inline: true },
+          { name: "📝 Raison", value: raison, inline: false },
+        ]),
+      ],
+    });
+  }
+
+  // ── ?unbl ──
+  if (command === "unbl") {
+    if (!hasPermission(member, "unbl")) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Permission refusée.")] });
+    }
+
+    const targetId = args[0]?.replace(/[<@!>]/g, "");
+    if (!targetId) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Usage", "`?unbl @user/ID`")] });
+
+    if (!store.blacklist.has(targetId)) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.warn, "⚠️ Introuvable", "Cet utilisateur n'est pas blacklisté.")] });
+    }
+
+    store.blacklist.delete(targetId);
+    return message.reply({ embeds: [embed(CONFIG.COLORS.success, "✅ Blacklist retirée", `L'utilisateur \`${targetId}\` a été retiré de la blacklist.`)] });
+  }
+
+  // ── ?blist ──
+  if (command === "blist") {
+    if (!hasPermission(member, "blist")) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Permission refusée.")] });
+    }
+
+    if (store.blacklist.size === 0) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.info, "📋 Blacklist vide", "Aucun utilisateur n'est actuellement blacklisté.")] });
+    }
+
+    const entries = [];
+    for (const [id, data] of store.blacklist.entries()) {
+      const u = await client.users.fetch(id).catch(() => null);
+      entries.push(`• **${u?.tag || id}** — ${data.reason} (<t:${Math.floor(new Date(data.date).getTime() / 1000)}:d>)`);
+    }
+
+    // Pagination simple si trop long
+    const chunks = [];
+    let current  = "";
+    for (const line of entries) {
+      if ((current + "\n" + line).length > 1000) {
+        chunks.push(current);
+        current = line;
+      } else {
+        current += (current ? "\n" : "") + line;
+      }
+    }
+    if (current) chunks.push(current);
+
+    for (let i = 0; i < chunks.length; i++) {
+      await message.reply({
+        embeds: [
+          embed(CONFIG.COLORS.bl, `⛔ Blacklist (${store.blacklist.size}) — page ${i + 1}/${chunks.length}`, chunks[i]),
+        ],
+      });
+    }
+    return;
+  }
+
+  // ── ?blinfo ──
+  if (command === "blinfo") {
+    if (!hasPermission(member, "blinfo")) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Accès refusé", "Permission refusée.")] });
+    }
+
+    const targetId = args[0]?.replace(/[<@!>]/g, "");
+    if (!targetId) return message.reply({ embeds: [embed(CONFIG.COLORS.error, "❌ Usage", "`?blinfo @user/ID`")] });
+
+    const blData = store.blacklist.get(targetId);
+    if (!blData) {
+      return message.reply({ embeds: [embed(CONFIG.COLORS.info, "ℹ️ Non blacklisté", "Cet utilisateur n'est pas dans la blacklist.")] });
+    }
+
+    const targetUser = await client.users.fetch(targetId).catch(() => null);
+    let modDisplay   = "🔴 Modérateur introuvable";
+    if (blData.modId) {
+      const mod = await client.users.fetch(blData.modId).catch(() => null);
+      modDisplay = mod ? `${mod.tag} (${mod.id})` : "🔴 Introuvable";
+    }
+
+    return message.reply({
+      embeds: [
+        embed(CONFIG.COLORS.bl, "📋 Informations de la blacklist", `Détails pour \`${targetUser?.tag || targetId}\``, [
+          { name: "🎯 Cible", value: targetUser ? `${targetUser.tag} (${targetId})` : targetId, inline: true },
+          { name: "👮 Modérateur", value: modDisplay, inline: true },
+          { name: "📝 Raison", value: blData.reason, inline: false },
+          { name: "📅 Date", value: `<t:${Math.floor(new Date(blData.date).getTime() / 1000)}:F>`, inline: false },
+        ]),
+      ],
+    });
+  }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// ─────────────────────────────────────────────
+//  KEEP-ALIVE (Express + self-ping)
+// ─────────────────────────────────────────────
+function startKeepAlive() {
+  const app = express();
+
+  app.get("/", (_req, res) => res.send("✅ Bot en ligne."));
+  app.get("/ping", (_req, res) => res.json({ status: "ok", uptime: process.uptime() }));
+
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`🌐 Serveur keep-alive sur le port ${PORT}`));
+
+  // Self-ping toutes les 60 secondes
+  setInterval(async () => {
+    try {
+      await fetch(`${CONFIG.RENDER_URL}/ping`);
+    } catch {
+      // Silencieux
+    }
+  }, 60 * 1000);
+}
+
+// ─────────────────────────────────────────────
+//  DÉMARRAGE
+// ─────────────────────────────────────────────
+if (!CONFIG.TOKEN) {
+  console.error("❌ TOKEN manquant. Définissez la variable d'environnement TOKEN sur Render.");
+  process.exit(1);
+}
+
+client.login(CONFIG.TOKEN);
