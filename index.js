@@ -33,7 +33,7 @@ const CONFIG = {
   CLIENT_ID: process.env.CLIENT_ID,
 
   // URL Render pour le keep-alive
-  RENDER_URL: "https://hhh-eyls.onrender.com",
+  RENDER_URL: "https://hhh-1-p6c9.onrender.com",
 
   // Rôle VIP pouvant derank sans raison (IDs Discord)
   VIP_ROLES: ["ID_ROLE_VIP_ICI"],
